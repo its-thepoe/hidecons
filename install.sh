@@ -38,8 +38,6 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
     <string>Hidecons</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
-    <key>LSBackgroundOnly</key>
-    <true/>
     <key>LSUIElement</key>
     <true/>
 </dict>

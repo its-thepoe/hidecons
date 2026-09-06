@@ -35,6 +35,7 @@ After launching, a grid icon appears in your menu bar.
 | **Left click** the icon | Instantly toggles desktop icons |
 | **⌥⌘H** from any app | Same toggle — no mouse needed |
 | **Right click** the icon | Opens settings menu |
+| Hide Widgets with Desktop Icons | Per-user preference, on by default; hides desktop widgets whenever icons are hidden |
 | Undo | Reverts the last toggle (appears in menu after any toggle) |
 | Launch at Login | Toggles auto-start on login — checkmark = enabled |
 | Notify on Toggle | Sends a macOS notification on each hide/show — off by default |
@@ -58,6 +59,7 @@ After launching, a grid icon appears in your menu bar.
 - Haptic feedback on toggle (MacBooks with Force Touch)
 - Tooltip showing current state on hover
 - Optional toggle notifications via macOS notification centre
+- Desktop widget hiding (macOS Sonoma 14 or later, enabled by default)
 - Custom app icon — shows correctly in System Settings → Login Items
 - Adapts to dark, light, and tinted menu bar themes
 
@@ -65,12 +67,17 @@ After launching, a grid icon appears in your menu bar.
 
 ## How it works
 
-Hidecons writes a single macOS preference and sends a reload signal to Finder:
+Hidecons writes the Finder preference and, when enabled, the macOS desktop-widget preference:
 
 ```bash
 defaults write com.apple.finder CreateDesktop -bool false
 killall -HUP Finder
 ```
+
+When “Hide Widgets with Desktop Icons” is enabled, Hidecons also toggles
+`com.apple.WindowManager` → `StandardHideWidgets`. The preference is stored per
+user and is on by default for new users. Hidecons remembers the previous widget setting and
+restores it when desktop icons are shown again.
 
 This is the standard technique used by all desktop-hiding utilities on macOS. Finder picks up the new preference and either stops drawing the desktop or re-renders it.
 
@@ -82,7 +89,8 @@ The preference persists in Finder's own plist — Hidecons writes nothing of its
 
 ## Requirements
 
-- macOS 10.15 (Catalina) or later
+- macOS 10.15 (Catalina) or later for desktop icons
+- macOS 14 (Sonoma) or later for desktop widget hiding
 - Xcode Command Line Tools (`xcode-select --install`)
 
 ---

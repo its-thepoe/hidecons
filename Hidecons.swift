@@ -2,7 +2,7 @@ import Cocoa
 import ServiceManagement
 import UserNotifications
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var statusItem: NSStatusItem!
     var isHidden = false
     var previousHidden: Bool? = nil
@@ -10,6 +10,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var undoItem: NSMenuItem!
     var launchAtLoginItem: NSMenuItem!
     var notificationsItem: NSMenuItem!
+    var hideWidgetsItem: NSMenuItem!
     var menu: NSMenu!
     var globalHotkeyMonitor: Any?
     var restoreTimer: Timer?
@@ -21,7 +22,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { UserDefaults.standard.set(newValue, forKey: "notificationsEnabled") }
     }
 
+    var hideWidgetsWithIcons: Bool {
+        get { UserDefaults.standard.bool(forKey: "hideWidgetsWithIcons") }
+        set { UserDefaults.standard.set(newValue, forKey: "hideWidgetsWithIcons") }
+    }
+
+    var widgetHiddenBeforeToggle: Bool? {
+        get {
+            guard let value = UserDefaults.standard.object(forKey: "widgetHiddenBeforeToggle") else {
+                return nil
+            }
+            return (value as? NSNumber)?.boolValue
+        }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(newValue, forKey: "widgetHiddenBeforeToggle")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "widgetHiddenBeforeToggle")
+            }
+        }
+    }
+
+    var desktopWidgetsSupported: Bool {
+        if #available(macOS 14.0, *) {
+            return true
+        }
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UserDefaults.standard.register(defaults: [
+            "hideWidgetsWithIcons": true
+        ])
+
+        UNUserNotificationCenter.current().delegate = self
+
         // Read current Finder state
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
@@ -34,6 +69,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         isHidden = (output == "0" || output == "false")
+
+        if isHidden && hideWidgetsWithIcons && desktopWidgetsSupported {
+            if widgetHiddenBeforeToggle == nil {
+                widgetHiddenBeforeToggle = readWindowManagerBoolean("StandardHideWidgets")
+            }
+            _ = writeWindowManagerBoolean("StandardHideWidgets", value: true)
+        }
 
         // Status item — left click toggles, right click opens menu
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -64,6 +106,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         notificationsItem.target = self
         menu.addItem(notificationsItem)
 
+        hideWidgetsItem = NSMenuItem(title: "Hide Widgets with Desktop Icons", action: #selector(toggleHideWidgets), keyEquivalent: "")
+        hideWidgetsItem.target = self
+        menu.addItem(hideWidgetsItem)
+
         menu.addItem(NSMenuItem.separator())
 
         let bugItem = NSMenuItem(title: "Report a Bug", action: #selector(reportBug), keyEquivalent: "")
@@ -84,6 +130,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         updateUI()
+        refreshNotificationAuthorization()
     }
 
     // Left click: instant toggle. Right click: menu.
@@ -104,23 +151,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleDesktop() {
         let newHidden = !isHidden
-        let value = newHidden ? "false" : "true"
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        task.arguments = ["write", "com.apple.finder", "CreateDesktop", "-bool", value]
-        try? task.run()
-        task.waitUntilExit()
-
-        guard task.terminationStatus == 0 else { return }
-
-        previousHidden = isHidden   // store for undo
-        isHidden = newHidden
-
-        let killTask = Process()
-        killTask.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        killTask.arguments = ["-HUP", "Finder"]
-        try? killTask.run()
+        guard setDesktopHidden(newHidden, rememberPrevious: true) else { return }
 
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
 
@@ -138,23 +169,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func undoToggle() {
         guard let prev = previousHidden else { return }
-
-        let value = prev ? "false" : "true"
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        task.arguments = ["write", "com.apple.finder", "CreateDesktop", "-bool", value]
-        try? task.run()
-        task.waitUntilExit()
-
-        guard task.terminationStatus == 0 else { return }
-
-        isHidden = prev
+        guard setDesktopHidden(prev, rememberPrevious: false) else { return }
         previousHidden = nil
-
-        let killTask = Process()
-        killTask.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-        killTask.arguments = ["-HUP", "Finder"]
-        try? killTask.run()
 
         NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
 
@@ -163,6 +179,95 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             updateUI()
         }
+    }
+
+    func setDesktopHidden(_ hidden: Bool, rememberPrevious: Bool) -> Bool {
+        let value = hidden ? "false" : "true"
+        guard runDefaults(arguments: ["write", "com.apple.finder", "CreateDesktop", "-bool", value]) else {
+            return false
+        }
+
+        if rememberPrevious {
+            previousHidden = isHidden
+        }
+
+        if hideWidgetsWithIcons && desktopWidgetsSupported {
+            if hidden {
+                if widgetHiddenBeforeToggle == nil {
+                    widgetHiddenBeforeToggle = readWindowManagerBoolean("StandardHideWidgets")
+                }
+                _ = writeWindowManagerBoolean("StandardHideWidgets", value: true)
+            } else if let previousWidgetState = widgetHiddenBeforeToggle {
+                _ = writeWindowManagerBoolean("StandardHideWidgets", value: previousWidgetState)
+                widgetHiddenBeforeToggle = nil
+            }
+        }
+
+        isHidden = hidden
+
+        let killTask = Process()
+        killTask.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        killTask.arguments = ["-HUP", "Finder"]
+        try? killTask.run()
+
+        return true
+    }
+
+    func readWindowManagerBoolean(_ key: String) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        task.arguments = ["read", "com.apple.WindowManager", key]
+
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        try? task.run()
+        task.waitUntilExit()
+
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        return output == "1" || output == "true"
+    }
+
+    func writeWindowManagerBoolean(_ key: String, value: Bool) -> Bool {
+        return runDefaults(arguments: [
+            "write", "com.apple.WindowManager", key, "-bool", value ? "true" : "false"
+        ])
+    }
+
+    func runDefaults(arguments: [String]) -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        task.arguments = arguments
+        try? task.run()
+        task.waitUntilExit()
+        return task.terminationStatus == 0
+    }
+
+    @objc func toggleHideWidgets() {
+        let shouldHide = !hideWidgetsWithIcons
+        hideWidgetsWithIcons = shouldHide
+
+        guard desktopWidgetsSupported else {
+            updateHideWidgetsItem()
+            return
+        }
+
+        if isHidden {
+            if shouldHide {
+                if widgetHiddenBeforeToggle == nil {
+                    widgetHiddenBeforeToggle = readWindowManagerBoolean("StandardHideWidgets")
+                }
+                _ = writeWindowManagerBoolean("StandardHideWidgets", value: true)
+            } else if let previousWidgetState = widgetHiddenBeforeToggle {
+                _ = writeWindowManagerBoolean("StandardHideWidgets", value: previousWidgetState)
+                widgetHiddenBeforeToggle = nil
+            }
+        }
+
+        updateHideWidgetsItem()
     }
 
     // Pulses arrow.clockwise ↔ grid for ~2s while Finder reloads the desktop
@@ -225,13 +330,46 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             notificationsEnabled = false
             updateNotificationsItem()
         } else {
-            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
                 DispatchQueue.main.async {
-                    self.notificationsEnabled = granted
+                    self.notificationsEnabled = granted && error == nil
+                    self.updateNotificationsItem()
+
+                    if !self.notificationsEnabled {
+                        self.showNotificationPermissionAlert()
+                    }
+                }
+            }
+        }
+    }
+
+    func refreshNotificationAuthorization() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let canDeliver = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+
+            DispatchQueue.main.async {
+                if self.notificationsEnabled && !canDeliver {
+                    self.notificationsEnabled = false
                     self.updateNotificationsItem()
                 }
             }
         }
+    }
+
+    func showNotificationPermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Hidecons notifications are disabled"
+        alert.informativeText = "Enable alerts for Hidecons in System Settings → Notifications, then turn on “Notify on Toggle” again."
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
     }
 
     @objc func reportBug() {
@@ -246,11 +384,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func sendToggleNotification() {
-        let content = UNMutableNotificationContent()
-        content.title = "Hidecons"
-        content.body = isHidden ? "Desktop icons hidden" : "Desktop icons visible"
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            let canDeliver = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+
+            DispatchQueue.main.async {
+                guard self.notificationsEnabled else { return }
+
+                guard canDeliver else {
+                    self.notificationsEnabled = false
+                    self.updateNotificationsItem()
+                    self.showNotificationPermissionAlert()
+                    return
+                }
+
+                let content = UNMutableNotificationContent()
+                content.title = "Hidecons"
+                content.sound = .default
+                content.body = self.isHidden && self.hideWidgetsWithIcons && self.desktopWidgetsSupported
+                    ? "Desktop icons and widgets hidden"
+                    : self.isHidden ? "Desktop icons hidden" : "Desktop icons visible"
+
+                let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+                center.add(request) { error in
+                    guard let error else { return }
+
+                    DispatchQueue.main.async {
+                        self.notificationsEnabled = false
+                        self.updateNotificationsItem()
+                        print("Hidecons notification failed: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
     }
 
     func updateUI() {
@@ -266,6 +432,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateUndoItem()
         updateLaunchAtLoginItem()
         updateNotificationsItem()
+        updateHideWidgetsItem()
     }
 
     func updateToggleItem() {
@@ -294,6 +461,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateNotificationsItem() {
         notificationsItem.state = notificationsEnabled ? .on : .off
+    }
+
+    func updateHideWidgetsItem() {
+        hideWidgetsItem.state = hideWidgetsWithIcons ? .on : .off
+        hideWidgetsItem.isEnabled = desktopWidgetsSupported
+        if !desktopWidgetsSupported {
+            hideWidgetsItem.title = "Hide Widgets with Desktop Icons (macOS 14+)"
+        } else {
+            hideWidgetsItem.title = "Hide Widgets with Desktop Icons"
+        }
     }
 }
 
